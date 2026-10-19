@@ -1,9 +1,12 @@
- use nix::sys::wait::waitpid;
+use colored::Colorize;
+use nix::libc::dup2;
+use nix::sys::wait::waitpid;
 use nix::unistd::{ForkResult, execvp, fork};
+use nix::unistd::{pipe, read, write};
 use std::ffi::CString;
 use std::io::Write;
+use std::os::fd::AsRawFd;
 use std::{env, io};
-use colored::Colorize;
 
 fn main() {
     println!("Welcome to minish>");
@@ -41,17 +44,74 @@ fn main() {
     }
 }
 
+fn run(words: &[&str]) {
+    // detect pipe
+    if let Some(idx) = words.iter().position(|w: &&str| *w == "|") {
+        let left_words = &words[..idx];
+        let right_words: &[&str] = &words[idx + 1..];
+        if right_words.is_empty() {
+            return;
+        }
+        let (read_fd, write_fd) = pipe().expect("Failed to create pipe");
 
-fn run(words:&[&str]){
-match unsafe { fork() } {
-                    Ok(ForkResult::Child) => {
-                        let c_words: Vec<CString> =
-                            words.iter().map(|w| CString::new(*w).unwrap()).collect();
-                        let _ = execvp(&c_words[0], &c_words);
-                    }
-                    Ok(ForkResult::Parent { child })=>{
-                        waitpid(child, None).unwrap();
-                    }
-                    Err(e) => eprintln!("fork failed: {e}"),
-                }
-} 
+        //first fork
+        let pid1: nix::unistd::Pid = match unsafe { fork() } {
+            Ok(ForkResult::Child) => {
+                // dupe write_fd to stdout
+                unsafe {
+                    dup2(write_fd.as_raw_fd(), 1);
+                    drop(write_fd);
+                    drop(read_fd);
+                };
+                run_exec(left_words);
+            }
+            Ok(ForkResult::Parent { child }) => child,
+            Err(e) => {
+                eprintln!("fork failed: {e}");
+                return;
+            }
+        };
+
+        //second fork
+        let pid2 = match unsafe { fork() } {
+            Ok(ForkResult::Child) => {
+                // dupe read_fd to stdin
+                unsafe {
+                    dup2(read_fd.as_raw_fd(), 0);
+                    drop(write_fd);
+                    drop(read_fd);
+                };
+                run_exec(right_words);
+            }
+            Ok(ForkResult::Parent { child }) => child,
+            Err(e) => {
+                eprintln!("fork failed: {e}");
+                return;
+            }
+        };
+        drop(write_fd);
+        drop(read_fd);
+        waitpid(pid1, None).unwrap();
+        waitpid(pid2, None).unwrap();
+    } else {
+        match unsafe { fork() } {
+            Ok(ForkResult::Child) => {
+                run_exec(words);
+            }
+            Ok(ForkResult::Parent { child }) => {
+                waitpid(child, None).unwrap();
+            }
+            Err(e) => eprintln!("fork failed: {e}"),
+        }
+    }
+}
+
+fn run_exec(words: &[&str]) -> ! {
+    // convert &str to CString
+    let c_words: Vec<CString> = words.iter().map(|w| CString::new(*w).unwrap()).collect();
+    match execvp(&c_words[0], &c_words) {
+        Ok(_) => {}
+        Err(e) => eprintln!("command failed: {e}"),
+    }
+    std::process::exit(127);
+}
